@@ -1,14 +1,14 @@
 // ==UserScript==
 // @name         YouTube 中英對照逐字稿（VoiceTube 風格）
 // @namespace    lulu.youtube.dualsubs
-// @version      3.2.1
+// @version      3.2.2
 // @description  在 YouTube 影片旁邊即時顯示中英對照逐字稿：點單字查中文（離線英漢字典、依句意排序、音標）、唸到的字即時標記、分開不同說話者、目前句子高亮、自動捲動、點句子跳轉、遮英文/遮中文、下載逐字稿；影片內也可顯示雙語字幕
 // @match        https://www.youtube.com/*
 // @run-at       document-start
 // @grant        none
 // @inject-into  page
-// @updateURL    https://raw.githubusercontent.com/oohya330-glitch/youtube-dual-subs/main/youtube-dual-subs/youtube-dual-subs.user.js
-// @downloadURL  https://raw.githubusercontent.com/oohya330-glitch/youtube-dual-subs/main/youtube-dual-subs/youtube-dual-subs.user.js
+// @updateURL    https://raw.githubusercontent.com/oohya330-glitch/youtube-dual-subs/main/youtube-dual-subs.user.js
+// @downloadURL  https://raw.githubusercontent.com/oohya330-glitch/youtube-dual-subs/main/youtube-dual-subs.user.js
 // ==/UserScript==
 
 (function () {
@@ -952,15 +952,22 @@ html[dark] #dt-pop .dp-sent{color:#bbb}
   }
 
   // 從字典解釋裡，挑出最符合這一句中文翻譯的那一個
+  const STOP_CHARS = '的了是在一不有人我他她它你這那個們之和與為地得著也就都而及或把被對到上下中大小來去說要會能可以';
   function pickContextual(groups, ctx, common) {
     const rank = new Map((common || []).map((c, i) => [c.term, i]));
     let best = null;
     groups.forEach((g, gi) => g.terms.forEach((term, ti) => {
-      const m = lcs(term, ctx);
-      const need = term.length === 1 ? 1 : 2;
-      if (m.len < need) return;
+      const core = term.replace(/[()（）.…]/g, '');
+      const m = lcs(core, ctx);
+      if (m.len < 1) return;
+      let weak = 0;
+      if (m.len === 1 && core.length > 1) {
+        // 只有一個字相同：字詞不能太長，且相同的字不能是常見虛字
+        if (core.length > 3 || STOP_CHARS.includes(ctx[m.pos])) return;
+        weak = 0.35;
+      }
       const r = rank.has(term) ? rank.get(term) : 99;
-      const score = m.len / term.length + m.len * 0.3 - ti * 0.01 - gi * 0.005 + (r < 99 ? 0.2 - r * 0.02 : 0);
+      const score = m.len / core.length + m.len * 0.3 - weak - ti * 0.01 - gi * 0.005 + (r < 99 ? 0.2 - r * 0.02 : 0);
       if (!best || score > best.score) best = { score, term, pos: g.pos, base: g.base, gi, ti };
     }));
     return best;
@@ -1090,8 +1097,8 @@ html[dark] #dt-pop .dp-sent{color:#bbb}
 
   /* ---------- 離線英漢字典 ECDICT（MIT 授權，https://github.com/skywind3000/ECDICT），轉成台灣繁體 ---------- */
   const DICT_URLS = [
-    'https://cdn.jsdelivr.net/gh/oohya330-glitch/youtube-dual-subs@main/youtube-dual-subs/dict/',
-    'https://raw.githubusercontent.com/oohya330-glitch/youtube-dual-subs/main/youtube-dual-subs/dict/',
+    'https://cdn.jsdelivr.net/gh/oohya330-glitch/youtube-dual-subs@main/dict/',
+    'https://raw.githubusercontent.com/oohya330-glitch/youtube-dual-subs/main/dict/',
   ];
   const dictFiles = new Map();
   function dictFile(letter) {
