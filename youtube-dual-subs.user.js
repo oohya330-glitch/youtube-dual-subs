@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         YouTube 中英對照逐字稿（VoiceTube 風格）
 // @namespace    lulu.youtube.dualsubs
-// @version      3.2.2
-// @description  在 YouTube 影片旁邊即時顯示中英對照逐字稿：點單字查中文（離線英漢字典、依句意排序、音標）、唸到的字即時標記、分開不同說話者、目前句子高亮、自動捲動、點句子跳轉、遮英文/遮中文、下載逐字稿；影片內也可顯示雙語字幕
+// @version      3.4.0
+// @description  在 YouTube 影片旁邊即時顯示中英對照逐字稿：點單字查中文（離線英漢字典、依句意排序、音標）、唸到的字即時標記、分開不同說話者、目前句子高亮、自動捲動、點句子跳轉、遮英文/遮中文、下載逐字稿；沒有字幕的影片可用聽寫產生逐字稿；影片內也可顯示雙語字幕
 // @match        https://www.youtube.com/*
 // @run-at       document-start
 // @grant        none
@@ -370,7 +370,8 @@
   }
 
   /* ---------- 翻譯：只翻正在看的段落、結果存起來、Google 不能用時改用 YouTube 翻譯 ---------- */
-  const TR_CACHE_KEY = 'dualsubs2-tr';
+  const TR_CACHE_KEY = 'dualsubs3-trg';   // 只存 Google 翻譯
+  try { localStorage.removeItem('dualsubs2-tr'); } catch (e) {}
   let trCache = null;
   function trCacheGet() {
     if (!trCache) { try { trCache = JSON.parse(localStorage.getItem(TR_CACHE_KEY) || '{}'); } catch (e) { trCache = {}; } }
@@ -437,6 +438,131 @@
     return (await t.translate(text)).trim();
   }
 
+  /* ---------- 聽寫模式：影片沒有字幕時，用瀏覽器的語音辨識「聽」影片的聲音 ---------- */
+  const dict = { on: false, lang: 'en-US', rec: null, track: null, videoId: null, session: 0, resStart: {}, restartT: 0, msg: '' };
+  let dictBar = null, interimEl = null;
+
+  function noCaptionTracks(player) {
+    let tl = [];
+    try { tl = player.getOption('captions', 'tracklist', { includeAsr: true }) || []; } catch (e) {}
+    if (tl.length) return false;
+    const cc = player.querySelector('.ytp-subtitles-button');
+    return !cc || cc.offsetParent === null || cc.getAttribute('aria-disabled') === 'true' || cc.disabled;
+  }
+
+  let dictBarShown = null, dictBarState = '';
+  function refreshDictBarLazy(show) {
+    const st = show + '|' + dict.on + '|' + dict.lang + '|' + dict.msg;
+    if (st !== dictBarState) { dictBarState = st; refreshDictBar(show); }
+  }
+  function refreshDictBar(show) {
+    dictBarState = show + '|' + dict.on + '|' + dict.lang + '|' + dict.msg;
+    if (!dictBar) return;
+    dictBar.style.display = show ? '' : 'none';
+    if (!show) return;
+    dictBar.textContent = '';
+    if (dict.on) {
+      dictBar.append(el('span', 'dt-rec', '●'), document.createTextNode(' 聽寫中（' + (dict.lang.startsWith('en') ? '英文' : '中文') + '）：影片播放時才會聽寫 '));
+      const b = el('button', 'dt-btn', '停止');
+      b.addEventListener('click', e => { e.stopPropagation(); stopDictation(); });
+      dictBar.append(b);
+    } else {
+      dictBar.append(document.createTextNode(dict.msg || '這支影片沒有字幕。要用聽寫產生逐字稿嗎？ '));
+      [['en-US', '聽寫英文'], ['zh-TW', '聽寫中文']].forEach(([lang, label]) => {
+        const b = el('button', 'dt-btn on', label);
+        b.addEventListener('click', e => { e.stopPropagation(); startDictation(lang); });
+        dictBar.append(b);
+      });
+    }
+  }
+
+  function startDictation(lang) {
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    const v = getVideo(), player = getPlayer();
+    if (!SR || !v || !player) { dict.msg = '這個瀏覽器不支援聽寫（請用新版 Chrome 或 Edge）。 '; refreshDictBar(true); return; }
+    const cur = currentVideoId(player);
+    if (dict.videoId !== cur || !String(state.key).startsWith('dict:')) {
+      state.key = 'dict:' + cur; state.videoId = cur; state.orig = []; state.trans = []; state.rows = []; state.version++;
+    }
+    dict.on = true; dict.lang = lang; dict.videoId = cur; dict.msg = '';
+    try {
+      if (!dict.track || dict.track.readyState !== 'live') {
+        const st = v.captureStream ? v.captureStream() : v.mozCaptureStream();
+        dict.track = st.getAudioTracks()[0] || null;
+      }
+    } catch (e) { dict.track = null; }
+    if (!dict.track) { dict.on = false; dict.msg = '無法取得影片的聲音，沒辦法聽寫。 '; refreshDictBar(true); return; }
+    refreshDictBar(true);
+    if (v.paused) v.play(); else runRec();
+  }
+
+  function stopDictation() {
+    dict.on = false;
+    clearTimeout(dict.restartT);
+    if (dict.rec) { try { dict.rec.stop(); } catch (e) {} }
+    setInterim('');
+    refreshDictBar(true);
+  }
+
+  function runRec() {
+    if (!dict.on || dict.rec) return;
+    const v = getVideo();
+    if (!v || v.paused) return;                     // 影片播放時才聽寫（暫停就停）
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    const rec = new SR();
+    rec.lang = dict.lang; rec.continuous = true; rec.interimResults = true;
+    const sess = ++dict.session;
+    rec.onresult = e => {
+      for (let i = e.resultIndex; i < e.results.length; i++) {
+        const r = e.results[i], k = sess + ':' + i;
+        if (!(k in dict.resStart)) dict.resStart[k] = Math.max(0, getVideo().currentTime * 1000 - 1500);
+        if (r.isFinal) { addDictRow(dict.resStart[k], r[0].transcript); delete dict.resStart[k]; setInterim(''); }
+        else setInterim(r[0].transcript);
+      }
+    };
+    rec.onerror = e => {
+      if (/not-allowed|service-not-allowed|language-not-supported|audio-capture/.test(e.error)) {
+        dict.on = false;
+        dict.msg = '語音辨識無法使用（' + e.error + '）。 ';
+        refreshDictBar(true);
+      }
+    };
+    rec.onend = () => {
+      dict.rec = null;
+      if (dict.on) { clearTimeout(dict.restartT); dict.restartT = setTimeout(runRec, 300); }   // 語音辨識會自己停，自動接續
+    };
+    try { rec.start(dict.track); dict.rec = rec; }
+    catch (e) { dict.on = false; dict.msg = '這個瀏覽器還不支援「聽影片聲音」的聽寫（' + e.message + '）。 '; refreshDictBar(true); }
+  }
+
+  function setInterim(text) {
+    if (!list) return;
+    if (!text) { if (interimEl) { interimEl.remove(); interimEl = null; } return; }
+    if (!interimEl) interimEl = el('div', 'dt-interim');
+    interimEl.textContent = '🎙 ' + text;
+    if (interimEl.parentNode !== list || list.lastChild !== interimEl) list.append(interimEl);
+  }
+
+  async function addDictRow(start, text) {
+    text = (text || '').trim();
+    if (!text) return;
+    const en = dict.lang.startsWith('en');
+    if (en) text = text[0].toUpperCase() + text.slice(1) + (/[.?!]$/.test(text) ? '' : '.');
+    const v = getVideo();
+    const r = { start, end: v ? v.currentTime * 1000 : start + 3000, en: text, zh: '', pending: en, src: 'dictation' };
+    const rows = state.rows;
+    let i = rows.length;
+    while (i > 0 && rows[i - 1].start > start) i--;   // 依時間插入（往回拉進度條時也會排好）
+    rows.splice(i, 0, r);
+    state.version++;
+    if (!en) return;
+    let z = null;
+    if (Date.now() >= googleBlockedUntil) { try { z = (await gtxBatch([r.en]))[0]; } catch (e) { googleBlockedUntil = Date.now() + 5 * 60 * 1000; } }
+    if (!z) { try { z = await builtinTranslate(r.en); } catch (e) {} }
+    r.zh = (z || '（暫時無法翻譯）').trim(); r.pending = false;
+    if (state.rows === rows) state.version++;
+  }
+
   let builtinBar = null;
   function refreshBuiltinBar() {
     if (!builtinBar) return;
@@ -473,49 +599,48 @@
     setSrcLabel('中文：YouTube 翻譯（Google 暫時無法使用）');
   }
 
+  // 用 Chrome 內建翻譯（品質較差，只在 Google 不能用時使用；結果不存起來，下次會再試 Google）
+  async function translateWithBuiltin(rows, need, key) {
+    const bt = builtin.tr || await builtinInit(false);
+    if (!bt) return false;
+    for (const i of need) {
+      if (state.key !== key) return true;
+      try { setZh(rows, i, (await bt.translate(rows[i].en)).trim()); }
+      catch (e) { setZh(rows, i, youtubeZhFor(rows, i) || '（暫時無法翻譯）', false, true); }
+    }
+    setSrcLabel('中文：瀏覽器內建翻譯（Google 暫時無法使用）');
+    return true;
+  }
+
   async function translateChunk(rows, idxs, key) {
-    // 先用存起來的翻譯
+    // 先用存起來的 Google 翻譯
     const cache = trCacheGet();
     const need = [];
     idxs.forEach(i => { const z = cache[trKey(rows[i].en)]; if (z) setZh(rows, i, z); else need.push(i); });
     if (!need.length) return;
-    // 1) 瀏覽器內建翻譯（優先：不會被封鎖）
-    const bt = builtin.tr || await builtinInit(false);
-    if (bt) {
-      for (const i of need) {
-        if (state.key !== key) return;
-        try {
-          const z = (await bt.translate(rows[i].en)).trim();
-          setZh(rows, i, z); cache[trKey(rows[i].en)] = z;
-        } catch (e) { setZh(rows, i, youtubeZhFor(rows, i) || '（暫時無法翻譯）', false, true); }
+    // 1) Google 翻譯（品質最好）
+    if (Date.now() >= googleBlockedUntil) {
+      let parts = null, err = null;
+      try { parts = await gtxBatch(need.map(i => rows[i].en)); } catch (e) { err = e; }
+      if (state.key !== key) return;
+      if (parts && parts.length === need.length) {
+        need.forEach((i, k) => { const z = parts[k].trim(); setZh(rows, i, z); cache[trKey(rows[i].en)] = z; });
+        trCacheSave();
+        setSrcLabel('中文：Google 翻譯');
+        return;
       }
-      trCacheSave();
-      setSrcLabel('中文：瀏覽器內建翻譯');
-      return;
-    }
-    // 2) Google 翻譯；3) 都不行時用 YouTube 翻譯
-    if (Date.now() < googleBlockedUntil) { useYouTubeFallback(rows, need); return; }
-    let parts = null, err = null;
-    try { parts = await gtxBatch(need.map(i => rows[i].en)); } catch (e) { err = e; }
-    if (state.key !== key) return;
-    if (parts && parts.length === need.length) {
-      need.forEach((i, k) => { const z = parts[k].trim(); setZh(rows, i, z); cache[trKey(rows[i].en)] = z; });
-      trCacheSave();
-      setSrcLabel('中文：Google 翻譯');
-      return;
-    }
-    if (err) {
+      if (!err && need.length > 1) {   // 行數對不上 → 拆小再翻
+        const h = need.length >> 1;
+        await translateChunk(rows, need.slice(0, h), key);
+        await translateChunk(rows, need.slice(h), key);
+        return;
+      }
+      if (!err) { setZh(rows, need[0], parts.join(' ').trim()); return; }
       googleBlockedUntil = Date.now() + 5 * 60 * 1000;     // 5 分鐘內不再打擾 Google
-      useYouTubeFallback(rows, need);
-      return;
     }
-    if (need.length > 1) {   // 行數對不上 → 拆小再翻
-      const h = need.length >> 1;
-      await translateChunk(rows, need.slice(0, h), key);
-      await translateChunk(rows, need.slice(h), key);
-      return;
-    }
-    setZh(rows, need[0], parts.join(' ').trim());
+    // 2) Google 不能用 → Chrome 內建翻譯；3) 再不行 → YouTube 翻譯
+    if (await translateWithBuiltin(rows, need, key)) return;
+    useYouTubeFallback(rows, need);
   }
 
   // 依需要翻譯：每 25 句一批，只翻「正在播放」和「正在看」的那幾批
@@ -593,6 +718,10 @@ html[dark] #dt-panel{background:#1f1f1f;color:#f1f1f1;border-color:rgba(255,255,
 #dt-panel .dt-listwrap{position:relative;flex:1;min-height:0;display:flex;flex-direction:column}
 #dt-panel .dt-builtin{padding:8px 12px;font-size:12px;background:rgba(6,95,212,.08);border-bottom:1px solid rgba(128,128,128,.2)}
 #dt-panel .dt-builtin .dt-btn{margin-left:6px}
+#dt-panel .dt-dict{background:rgba(229,57,53,.07)}
+#dt-panel .dt-rec{color:#e53935;animation:dtblink 1.2s infinite}
+@keyframes dtblink{50%{opacity:.25}}
+#dt-panel .dt-interim{padding:8px 12px 8px 62px;color:#888;font-style:italic;font-size:var(--dt-fs)}
 #dt-panel.collapsed .dt-builtin{display:none!important}
 #dt-panel .dt-back{position:absolute;left:50%;bottom:10px;transform:translateX(-50%);z-index:2;border:none;border-radius:16px;padding:6px 14px;background:#065fd4;color:#fff;font-size:13px;font-family:inherit;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,.3)}
 #dt-panel .dt-back:hover{background:#0b57d0}
@@ -663,7 +792,7 @@ html[dark] #dt-pop .dp-sent{color:#bbb}
   }
 
   /* ---------- 右側逐字稿面板 ---------- */
-  let backBtn = null, srcLabel = null, speakRow = null, speakK = -1;
+  let backBtn = null, srcLabel = null, speakRow = null, speakK = -1, lastRenderedVid = null;
   let panel, list, emptyMsg, items = [], activeIdx = -1, renderedKey = '', lastUserScroll = 0;
   const btns = {};
 
@@ -739,9 +868,11 @@ html[dark] #dt-pop .dp-sent{color:#bbb}
     backBtn.style.display = 'none';
     backBtn.addEventListener('click', e => { e.stopPropagation(); lastUserScroll = 0; scrollToActive(true); backBtn.style.display = 'none'; });
     wrap.append(list, backBtn);
+    dictBar = el('div', 'dt-builtin dt-dict');
+    dictBar.style.display = 'none';
     builtinBar = el('div', 'dt-builtin');
     builtinBar.style.display = 'none';
-    panel.append(head, builtinBar, wrap, emptyMsg);
+    panel.append(head, dictBar, builtinBar, wrap, emptyMsg);
     refreshBuiltinBar();
     refreshPanelSettings();
   }
@@ -772,13 +903,15 @@ html[dark] #dt-pop .dp-sent{color:#bbb}
   function renderList(cur) {
     if (srcLabel) {
       const src = cur === state.videoId && state.rows[0] && state.rows[0].src;
-      srcLabel.textContent = src === 'human' ? '中文：人工字幕' : src === 'google' ? (trSrcText || '中文：翻譯中') : src === 'youtube' ? '中文：YouTube 翻譯' : '';
+      srcLabel.textContent = src === 'dictation' ? (dict.lang.startsWith('en') ? '英文：聽寫（自動辨識，可能有錯字）' : '中文：聽寫') : src === 'human' ? '中文：人工字幕' : src === 'google' ? (trSrcText || '中文：翻譯中') : src === 'youtube' ? '中文：YouTube 翻譯' : '';
     }
-    list.textContent = ''; items = []; activeIdx = -1;
+    const keepScroll = lastRenderedVid === cur ? list.scrollTop : 0;
+    lastRenderedVid = cur;
+    list.textContent = ''; items = []; activeIdx = -1; speakRow = null; speakK = -1;
     if (cur !== state.videoId || !state.rows.length) {
       emptyMsg.style.display = '';
       emptyMsg.textContent = cur === state.videoId
-        ? '字幕載入中…'
+        ? (dict.on ? '聽寫中，請播放影片…' : '字幕載入中…')
         : '影片開始播放後，字幕會出現在這裡。\n（影片需要有字幕或自動產生的字幕；\n若一直沒出現，請按播放器上的 CC 按鈕）';
       return;
     }
@@ -799,7 +932,8 @@ html[dark] #dt-pop .dp-sent{color:#bbb}
       items.push(it);
     });
     list.append(frag);
-    list.scrollTop = 0;
+    list.scrollTop = keepScroll;
+    if (interimEl && dict.on) list.append(interimEl);
   }
 
   // 目前句子是否完整出現在面板可見範圍內
@@ -1367,6 +1501,17 @@ html[dark] #dt-pop .dp-sent{color:#bbb}
         if (key !== renderedKey) { renderedKey = key; renderList(cur); }
         followCheck();
         if (activeIdx >= 0) ensureTranslated(activeIdx);
+        // 聽寫：換影片就停；沒有字幕時顯示「聽寫」選項
+        if (dict.on && dict.videoId !== cur) stopDictation();
+        if (video && !video.__dictHooked) {
+          video.__dictHooked = true;
+          video.addEventListener('play', () => { if (dict.on && !dict.rec) runRec(); });
+          video.addEventListener('pause', () => { if (dict.rec) { try { dict.rec.stop(); } catch (e) {} } });
+        }
+        const offer = location.pathname === '/watch' && cur && !player.classList.contains('ad-showing') &&
+          ((dict.on && dict.videoId === cur) || (dict.videoId === cur && String(state.key).startsWith('dict:')) ||
+           (state.videoId !== cur && Date.now() - navTime > 6000 && noCaptionTracks(player)));
+        refreshDictBarLazy(!!offer);
       }
     }
 
